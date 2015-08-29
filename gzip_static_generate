@@ -118,7 +118,7 @@ my %opt = get_options(
     '--cmd|-c' => {
         multi   => 1,
         value   => qr|^[\w./\-\s]+$|,
-        default => 'zopfli -c, gzip -c9',
+        default => 'zopfli, gzip -kf9',
     },
     '--help|-h'    => { then => \&help },
     '--man'        => { then => \&man },
