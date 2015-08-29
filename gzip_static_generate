@@ -1,0 +1,273 @@
+#!/usr/bin/perl
+use warnings;
+use strict;
+use List::Util qw(first any);
+# Pod::Usage require'd on demand, below
+
+=head1 NAME
+
+gzip_static_generate - Generate pre-compressed files for nginx
+
+=head1 SYNOPSIS
+
+gzip_static_generate [options] /path/to/folder
+
+  Options:
+    --types      <extension>   file type constraint
+    --min_length <number>      minimum file length constraint
+    --cmd        <command>     gzip command to use
+    --help/-h                  show help message
+    --man                      show full documentation
+    --version/-v               print version
+
+=head1 DESCRIPTION
+
+B<gzip_static_generate> generates pre-compressed versions of files for use
+with the C<gzip_static> directive of the L<nginx|http://nginx.org/>
+webserver.
+
+For each eligible file inside the specified directory tree, a gzipped
+version is created along-side it (with the same path plus the .gz suffix).
+
+Files which I<already> have an up-to-date compressed version, are skipped
+- thus it's fine to repeatedly run this program on the same directory, for
+example using a cron job.
+
+B<Examples:>
+
+    # Pre-compress files of common text-based web file types:
+    gzip_static_generate /srv/http
+    
+    # Pre-compress .pdf and .doc files in addition to the normal types:
+    gzip_static_generate --types+=pdf,doc /srv/http
+    
+    # Pre-compress *only* .html files larger than 1kB:
+    gzip_static_generate --types=html --min_length=1024 /srv/http
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--types> <extension>
+
+Only process files with the given filename extension. (Similar to the
+C<gzip_types> config option in nginx.) May contain the * and ? glob
+wildcards.
+
+Accepts multiple values, in which case any files matching at least one of
+them is processed.
+
+I<Default value:> C<html,htm,?html,txt,css,js,xml,rss,atom,svg,mml,kml>
+
+=item B<--min_length> <number>
+
+Only process files which are larger than the given file size, in bytes.
+(Corresponds to the C<gzip_min_length> config option in nginx.)
+
+I<Default value:> C<50>
+
+=item B<--cmd> <command>
+
+The command to run for gzipping files. The input filename is automatically
+appended as the last argument. Must write the gzipped data to the same
+filename plus .gz suffix, without deleting the original. May not contain
+shell syntax - just the command name or path plus optionally
+whitespace-separated arguments.
+
+Accepts multiple values, in which case the first one that specifies a
+program that can actually be found, will be used.
+
+I<Default value:> C<zopfli, gzip -kf9>.
+
+=item B<--help> / B<-h>
+
+Print a brief help message and exit.
+
+=item B<--man>
+
+Open the manual page and exit.
+
+=item B<--version> / B<-v>
+
+Print the version number and exit.
+
+=back
+
+Multiple values can be specified by passing the same option multiple
+times, and/or by passing it a comma-separated string. Whitespace
+surrounding values is ignored.
+
+Normally, specifying an option overrides its default value. However,
+if the special C<--option+=value> syntax is used at least once, the
+default value of that option is included as well.
+
+=cut
+
+#--- Argument processing ---#
+
+my %opt = get_options(
+    '--types' => {
+        multi   => 1,
+        value   => qr|^[\w*?]+(?:\.[\w*?]+)*$|,
+        default => 'html,htm,?html,txt,css,js,xml,rss,atom,svg,mml,kml',
+    },
+    '--min_length' => {
+        value   => qr|^[0-9]+$|,
+        default => 50,
+    },
+    '--cmd|-c' => {
+        multi   => 1,
+        value   => qr|^[\w./\-\s]+$|,
+        default => 'zopfli -c, gzip -c9',
+    },
+    '--help|-h'    => { then => \&help },
+    '--man'        => { then => \&man },
+    '--version|-v' => { then => sub { print "v0.1\n"; exit } },
+);
+
+my $dir = shift(@ARGV) or die "Must specify a folder.\n";
+-d $dir                or die "'$dir' is not a valid folder.\n";
+
+
+#--- Main code ---#
+
+my @cmd = @{ (first { program_exists($_->[0]) }
+              map {[ split ' ' ]} @{$opt{cmd}}) // [] };
+@cmd or die "No program found for gzipping (tried " . 
+            (join ', ', map { "'$_'" } @{$opt{cmd}}) . "). ".
+            "Please specify one with the --cmd option.\n";
+
+for_files($dir, {%opt, nottypes => ['gz']}, sub {
+    my $file = shift;
+    my $filegz = "$file.gz";
+    
+    if (!-e $filegz || mtime($file) > mtime($filegz)) {
+        print STDERR "$filegz\n";
+        unlink $filegz;
+        system(@cmd, $file) == 0 or die "Calling @cmd failed: $?";
+        system('touch', '-c', "--reference=$file", $filegz);
+    }
+});
+
+
+#--- Functions ---#
+
+#| Calls a callback for each filename in a specified directory tree
+sub for_files {
+    my ($dir, $opt, $callback) = @_;
+    my @args;
+    
+    my $or = sub {
+        my @expr = map {('-o', ref $_ ? @{$_} : $_)} @_;
+        shift @expr;
+        @_ > 1 ? ('(', @expr,')') : @expr
+    };
+    
+    if (defined $opt->{types}) {
+        push @args, $or->( map {[ '-iname', "*.$_" ]} @{$opt->{types}} );
+    }
+    if (defined $opt->{nottypes}) {
+        push @args, map {( '!', '-iname', "*.$_" )} @{$opt->{nottypes}};
+    }
+    if (defined $opt->{min_length}) {
+        push @args, '-size', '+'.($opt->{min_length}).'c';
+    }
+    
+    open my $find, "-|", 'find', $dir, qw[-type f], @args, '-print0'
+        or die "Could not run 'find'.\n";
+    
+    local $/ = "\0";
+    while (<$find>) { chomp; $callback->($_) }
+    
+    close $find;
+    $? == 0 or die "The 'find' command failed.\n"
+}
+
+
+#| Returns the 'last modified' time of a file
+sub mtime { (stat(shift))[9] }
+
+
+#| Returns true if the program with the specified name or path exists
+sub program_exists {
+    my $name = shift;
+    $name =~ m|^[./]| && -f $name
+                      || any { -f "$_/$name" } split /:/, $ENV{PATH};
+}
+
+#| Parse command-line arguments according to a given specification, and
+#| return them as a hash. Positional arguments are left in @ARGV.
+sub get_options {
+    my %spec = @_;
+    my @positional;
+    my %named;
+    
+    # Expand synonyms and defaults
+    my %alias;
+    for (keys %spec) {
+        my @names = split /\|/, $_;
+        my @realnames = map { s/^--?//r } @names;
+        my $canonical = $realnames[0];
+        my $spec = $spec{$_};
+        $spec->{name} = $canonical;
+        delete $spec{$_};
+        $alias{$_} = $canonical for @names;
+        $spec{$canonical} = $spec;
+    };
+    
+    # Parse @ARGV
+    while (defined($_ = shift @ARGV)) {
+        if (/^(--?\w+)/g) {
+            my $found = $1;
+            my $name = $alias{$found} // usage("Unknown option $found.");
+            my $spec = $spec{$name};
+            
+            if (/\G(\+)?=(.*)/) {
+                $spec->{value} or usage("Flag $found doesn't accept a value.");
+                push @{$named{$name}}, $2, $1 ? $spec->{default}//() : ();
+            }
+            elsif (/\G$/) {
+                push @{$named{$name}}, $spec->{value}
+                    ? shift(@ARGV) // usage("Option $found expects a value.")
+                    : 1;
+            }
+            else { usage("Failed to parse option $found.") }
+        }
+        else { push @positional, $_ }
+    }
+    
+    # Sanitize and validate
+    for my $name (sort keys %spec) {
+        my $spec = $spec{$name};
+        
+        my @v = map { s/^\s+|\s+$//gr }
+                map { split /,\s*/ }
+                @{$named{$name} // [$spec->{default} // next]};
+        
+        if ($spec->{value}) {
+            /$spec->{value}/ or usage("Invalid $name value '$_'.") for @v;
+        }
+        
+        if ($spec->{multi}) {
+            $named{$name} = [do { my %seen; grep { !$seen{$_}++ } @v }];
+        }
+        else {
+            @v <= 1 or usage("Option $name doesn't accept multiple values.");
+            $named{$name} = $v[0];
+        }
+        
+        $spec->{then}() if $spec->{then} && $named{$name};
+    }
+    
+    @ARGV = @positional;
+    return %named;
+}
+
+#| Show a usage/help message, and exit.
+sub usage {
+    my ($m, $v, $e) = @_;
+    require Pod::Usage;
+    Pod::Usage::pod2usage(-message => $m, -verbose => $v//0, -exitval => $e//2);
+}
+sub help { usage(undef, 1, 0) }
+sub man { usage(undef, 2, 0) }
