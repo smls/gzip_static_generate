@@ -37,3 +37,9 @@ sudo cp gzip_static_generate.1.gz /usr/share/man/man1/
 ## Documentation
 
 See the man page. (If you didn't install it the normal way, you can still view it on-demand by calling `gzip_static_generate --man`).
+
+## Copyright and License
+
+© 2015 Sam S (smls)
+
+This is free software; you can redistribute it and/or modify it under the terms of the Artistic License 2.0 (see the accompanying LICENSE file).
